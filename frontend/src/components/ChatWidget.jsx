@@ -2,6 +2,11 @@ import { useState, useRef, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { sendTextMessage, sendVoiceMessage, audioUrl } from "../api";
 
+// --- Voice activity detection tuning ---
+const SPEECH_THRESHOLD = 0.02; // raise if background noise triggers it, lower if quiet speech is missed
+const SILENCE_MS = 1200;       // pause length that means "user is done talking"
+const MIN_SPEECH_MS = 300;     // ignore accidental taps/coughs shorter than this
+
 function getSessionId() {
   let id = sessionStorage.getItem("chat_session_id");
   if (!id) {
@@ -19,7 +24,7 @@ function VoiceOrb({ state, onClick }) {
   return (
     <button
       onClick={onClick}
-      aria-label={state === "listening" ? "Stop recording" : "Start voice input"}
+      aria-label={state === "listening" ? "Stop voice chat" : "Start voice chat"}
       className="relative w-28 h-28 flex items-center justify-center focus:outline-none group"
     >
       {(state === "listening" || state === "speaking") && (
@@ -102,8 +107,19 @@ export default function ChatWidget({ companySlug, companyName }) {
   const [showTextInput, setShowTextInput] = useState(false);
   const [language, setLanguage] = useState("en");
 
-  const mediaRecorderRef = useRef(null);
+  // --- voice session refs (replaces the old single mediaRecorderRef) ---
+  const streamRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const analyserRef = useRef(null);
+  const recorderRef = useRef(null);
   const chunksRef = useRef([]);
+  const rafRef = useRef(null);
+  const silenceTimerRef = useRef(null);
+  const speechStartRef = useRef(null);
+  const recordingRef = useRef(false);
+  const sessionActiveRef = useRef(false);   // whole listen-session on/off (tap orb to toggle)
+  const listeningPausedRef = useRef(false); // true while bot is thinking/speaking, so mic ignores it
+
   const sessionId = useRef(getSessionId());
   const audioRef = useRef(new Audio());
   const scrollRef = useRef(null);
@@ -112,6 +128,12 @@ export default function ChatWidget({ companySlug, companyName }) {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, orbState]);
+
+  // stop everything and release the mic
+  useEffect(() => {
+    return () => stopSession();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function unlockAudio() {
     const el = audioRef.current;
@@ -122,8 +144,15 @@ export default function ChatWidget({ companySlug, companyName }) {
   function playAudio(url) {
     const el = audioRef.current;
     el.src = url;
-    el.onended = () => setOrbState("idle");
-    el.play().catch(() => setOrbState("idle"));
+    el.onended = () => {
+      // bot finished speaking — resume auto-listening for the next sentence
+      listeningPausedRef.current = false;
+      setOrbState(sessionActiveRef.current ? "listening" : "idle");
+    };
+    el.play().catch(() => {
+      listeningPausedRef.current = false;
+      setOrbState(sessionActiveRef.current ? "listening" : "idle");
+    });
   }
 
   function appendMessage(role, text, isVoice = false) {
@@ -139,14 +168,16 @@ export default function ChatWidget({ companySlug, companyName }) {
         setOrbState("speaking");
         playAudio(audioUrl(data.audio_url));
       } else {
-        setOrbState("idle");
+        listeningPausedRef.current = false;
+        setOrbState(sessionActiveRef.current ? "listening" : "idle");
       }
       if (data.escalated && data.answer.includes("Ticket ID:")) {
         setMessages((prev) => [...prev, { role: "escalation", id: crypto.randomUUID() }]);
       }
     } catch (err) {
       appendMessage("system", "Something went wrong. Please try again.");
-      setOrbState("idle");
+      listeningPausedRef.current = false;
+      setOrbState(sessionActiveRef.current ? "listening" : "idle");
     }
   }
 
@@ -159,41 +190,142 @@ export default function ChatWidget({ companySlug, companyName }) {
     handleBotResponse(sendTextMessage(companySlug, sessionId.current, text, language));
   }
 
-  async function handleOrbClick() {
-    if (orbState === "thinking" || orbState === "speaking") return;
+  // --- Voice activity detection loop ---
 
-    if (orbState === "listening") {
-      mediaRecorderRef.current?.stop();
+  function startRecordingChunk() {
+    if (recordingRef.current || !streamRef.current) return;
+    recordingRef.current = true;
+    speechStartRef.current = Date.now();
+
+    chunksRef.current = [];
+    const recorder = new MediaRecorder(streamRef.current, { mimeType: "audio/webm" });
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunksRef.current.push(e.data);
+    };
+    recorder.onstop = () => {
+      const spokeFor = Date.now() - (speechStartRef.current || 0);
+      const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+      chunksRef.current = [];
+      recordingRef.current = false;
+
+      if (spokeFor >= MIN_SPEECH_MS && blob.size > 0 && sessionActiveRef.current) {
+        listeningPausedRef.current = true; // don't record the bot's own voice back
+        appendMessage("user", "Voice message", true);
+        handleBotResponse(sendVoiceMessage(companySlug, sessionId.current, blob, language));
+      }
+    };
+    recorder.start();
+    recorderRef.current = recorder;
+  }
+
+  function scheduleSilenceStop() {
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    silenceTimerRef.current = setTimeout(() => {
+      if (recordingRef.current && recorderRef.current) {
+        recorderRef.current.stop();
+      }
+    }, SILENCE_MS);
+  }
+
+  function monitorVolume() {
+    if (!sessionActiveRef.current) return; // session ended — stop the loop
+
+    const analyser = analyserRef.current;
+    if (!analyser || listeningPausedRef.current) {
+      // bot is thinking/speaking right now — don't listen to itself
+      rafRef.current = requestAnimationFrame(monitorVolume);
       return;
     }
 
-    unlockAudio();
+    const data = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(data);
 
+    let sumSquares = 0;
+    for (let i = 0; i < data.length; i++) {
+      const norm = (data[i] - 128) / 128;
+      sumSquares += norm * norm;
+    }
+    const rms = Math.sqrt(sumSquares / data.length);
+
+    if (rms > SPEECH_THRESHOLD) {
+      if (!recordingRef.current) startRecordingChunk();
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
+    } else if (recordingRef.current && !silenceTimerRef.current) {
+      scheduleSilenceStop();
+    }
+
+    rafRef.current = requestAnimationFrame(monitorVolume);
+  }
+
+  async function startSession() {
+    unlockAudio();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
-      chunksRef.current = [];
+      streamRef.current = stream;
 
-      recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
-      recorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-        appendMessage("user", "Voice message", true);
-        handleBotResponse(sendVoiceMessage(companySlug, sessionId.current, blob, language));
-        stream.getTracks().forEach((t) => t.stop());
-      };
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
 
-      recorder.start();
-      mediaRecorderRef.current = recorder;
+      audioCtxRef.current = audioCtx;
+      analyserRef.current = analyser;
+
+      sessionActiveRef.current = true;
+      listeningPausedRef.current = false;
       setOrbState("listening");
+      rafRef.current = requestAnimationFrame(monitorVolume);
     } catch {
       appendMessage("system", "Microphone access is needed for voice input. You can also type below.");
       setShowTextInput(true);
     }
   }
 
+  function stopSession() {
+    sessionActiveRef.current = false;
+    listeningPausedRef.current = false;
+
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    silenceTimerRef.current = null;
+
+    if (recorderRef.current && recorderRef.current.state !== "inactive") {
+      recorderRef.current.stop();
+    }
+    recorderRef.current = null;
+    recordingRef.current = false;
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close();
+      audioCtxRef.current = null;
+    }
+    analyserRef.current = null;
+
+    setOrbState("idle");
+  }
+
+  function handleOrbClick() {
+    if (orbState === "thinking") return;
+
+    if (sessionActiveRef.current) {
+      stopSession();
+    } else {
+      startSession();
+    }
+  }
+
   const orbLabel = {
     idle: "Tap to speak",
-    listening: "Listening… tap to stop",
+    listening: "Listening… just talk, I'll catch it",
     thinking: "Thinking…",
     speaking: "Speaking…",
   }[orbState];
@@ -247,10 +379,10 @@ export default function ChatWidget({ companySlug, companyName }) {
             <div key={m.id} className={`flex flex-col animate-msg-in ${m.role === "user" ? "items-end" : "items-start"}`}>
               <div
                 className={`max-w-[82%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed flex items-center gap-2 ${m.role === "user"
-                    ? "bg-signal text-white rounded-br-sm"
-                    : m.role === "system"
-                      ? "bg-ink-700 text-mist-200 mx-auto text-xs text-center"
-                      : "bg-ink-800 text-mist-100 rounded-bl-sm border border-ink-700"
+                  ? "bg-signal text-white rounded-br-sm"
+                  : m.role === "system"
+                    ? "bg-ink-700 text-mist-200 mx-auto text-xs text-center"
+                    : "bg-ink-800 text-mist-100 rounded-bl-sm border border-ink-700"
                   }`}
               >
                 {m.isVoice && (
