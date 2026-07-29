@@ -1,6 +1,7 @@
 import os
 import shutil
 import uuid
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -39,6 +40,18 @@ def _is_affirmative(text: str) -> bool:
 def _is_negative(text: str) -> bool:
     t = text.strip().lower().rstrip(".!")
     return t in NEGATIVE or any(t.startswith(a) for a in NEGATIVE)
+
+
+def _time_greeting() -> str:
+    """Friendly, time-aware opener used for the first message of a session."""
+    hour = datetime.now().hour
+    if hour < 12:
+        part_of_day = "good morning"
+    elif hour < 17:
+        part_of_day = "good afternoon"
+    else:
+        part_of_day = "good evening"
+    return f"Hii there, {part_of_day}! How can I help you?"
 
 
 def _get_company_or_404(slug: str, db: Session) -> Company:
@@ -135,6 +148,8 @@ def _handle_question(db: Session, company: Company, session_id: str, question: s
     pre_escalate = needs_escalation(question, chunks)
 
     history = _recent_history(db, company.id, session_id)
+    is_first_message = len(history) == 0
+
     answer, confidence = generate_answer(
         company.name, question, chunks, history,
         language=language, known_entities=known_entities, frustrated=frustrated,
@@ -148,6 +163,9 @@ def _handle_question(db: Session, company: Company, session_id: str, question: s
             answer.rstrip(".") + ". I'm not fully confident about that — "
             "would you like me to create a support ticket so a team member can follow up?"
         )
+
+    if is_first_message and not frustrated:
+        answer = f"{_time_greeting()} {answer}"
 
     return _save_and_respond(db, company, session_id, question, answer, escalate, want_audio, language)
 

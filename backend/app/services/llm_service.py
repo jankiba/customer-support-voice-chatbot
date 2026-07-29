@@ -60,6 +60,13 @@ FRUSTRATION_KEYWORDS = [
     "disappointed", "useless",
 ]
 
+# Baseline personality applied to every response, regardless of mood.
+BASE_TONE = (
+    "Speak like a warm, friendly human support agent — casual and upbeat, "
+    "not robotic or overly formal. Use natural phrasing like \"Sure thing!\", "
+    "\"Got it!\", or \"No worries!\" where it fits naturally."
+)
+
 
 def needs_escalation(question: str, retrieved_chunks: list[str]) -> bool:
     """Cheap pre-check before even calling the LLM."""
@@ -93,12 +100,15 @@ def generate_answer(
     """
     context = "\n".join(f"- {c}" for c in context_chunks) if context_chunks else "No relevant documents found."
     language_name = LANGUAGE_NAMES.get(language, "English")
+
     tone_instruction = (
-        "The customer seems frustrated or upset. Briefly acknowledge that with empathy "
-        "before addressing their question."
+        BASE_TONE + " The customer seems frustrated or upset — briefly acknowledge "
+        "that with empathy before addressing their question, and keep things calm "
+        "rather than overly cheerful."
         if frustrated
-        else ""
+        else BASE_TONE
     )
+
     entities_str = ", ".join(f"{k}: {v}" for k, v in (known_entities or {}).items()) or "None yet."
 
     messages = [

@@ -3,6 +3,16 @@
 # share across multiple backend processes. Fine for a single-instance
 # deployment; move to Redis if you scale out.
 _session_store: dict[str, dict] = {}
+from datetime import datetime
+
+def get_time_based_greeting():
+    hour = datetime.now().hour
+    if hour < 12:
+        return "Hii, good morning! How can I help you today?"
+    elif hour < 17:
+        return "Hii, good afternoon! How can I help you today?"
+    else:
+        return "Hii, good evening! How can I help you today?"
 
 
 def _get(session_id: str) -> dict:
