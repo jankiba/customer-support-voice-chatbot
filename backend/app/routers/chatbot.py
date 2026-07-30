@@ -54,6 +54,33 @@ def _time_greeting() -> str:
     return f"Hii there, {part_of_day}! How can I help you?"
 
 
+GREETING_WORDS = {"hi", "hii", "hello", "hey", "yo", "hola", "greetings", "namaste"}
+TIME_GREETINGS = {"good morning", "good afternoon", "good evening"}
+GREETING_FILLER_WORDS = {"there", "friend", "team", "guys", "everyone", "again"}
+
+
+def _is_smalltalk_greeting(text: str) -> bool:
+    """
+    True for plain greetings with no real question in them — e.g. 'hi',
+    'hello', 'hi there', 'hey there', 'good morning'. Anything with real
+    content after the greeting (e.g. 'hi, what are your hours') falls through
+    to the normal pipeline.
+    """
+    t = text.strip().lower().strip("!.,? ")
+    if not t:
+        return False
+    if t in TIME_GREETINGS:
+        return True
+
+    words = t.split()
+    first_word = words[0]
+    if first_word not in GREETING_WORDS:
+        return False
+
+    remainder = words[1:]
+    return all(w in GREETING_FILLER_WORDS for w in remainder)
+
+
 def _get_company_or_404(slug: str, db: Session) -> Company:
     company = db.query(Company).filter(Company.slug == slug).first()
     if not company:
@@ -139,6 +166,17 @@ def _handle_question(db: Session, company: Company, session_id: str, question: s
             answer = "No problem — let me know if there's anything else I can help with."
             return _save_and_respond(db, company, session_id, question, answer, False, want_audio, language)
 
+    history = _recent_history(db, company.id, session_id)
+    is_first_message = len(history) == 0
+
+    # Plain greetings ("hi", "hello", "good morning"...) never go through the
+    # knowledge-base search / confidence pipeline — there's nothing to look up,
+    # so treating them as low-confidence just triggers a pointless "create a
+    # ticket?" prompt. Answer them directly instead.
+    if _is_smalltalk_greeting(question):
+        answer = _time_greeting() if is_first_message else "Hey! How can I help you?"
+        return _save_and_respond(db, company, session_id, question, answer, False, want_audio, language)
+
     update_entities(session_id, extract_entities(question))
     known_entities = get_entities(session_id)
 
@@ -146,9 +184,6 @@ def _handle_question(db: Session, company: Company, session_id: str, question: s
 
     chunks = search(company.id, question)
     pre_escalate = needs_escalation(question, chunks)
-
-    history = _recent_history(db, company.id, session_id)
-    is_first_message = len(history) == 0
 
     answer, confidence = generate_answer(
         company.name, question, chunks, history,
@@ -164,7 +199,7 @@ def _handle_question(db: Session, company: Company, session_id: str, question: s
             "would you like me to create a support ticket so a team member can follow up?"
         )
 
-    if is_first_message and not frustrated:
+    if is_first_message and not frustrated and not answer.lower().startswith(("hi", "hii", "hello", "hey")):
         answer = f"{_time_greeting()} {answer}"
 
     return _save_and_respond(db, company, session_id, question, answer, escalate, want_audio, language)
